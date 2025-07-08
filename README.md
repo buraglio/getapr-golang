@@ -1,102 +1,101 @@
-# getapr
-Get Address Pairs for socket programming in Python
+Markdown
+# GetAPR - Advanced Path Reporter
 
-~~~
-Help on module getapr:
+A Go implementation of network path analysis tool that tests connectivity between source and destination addresses with strict interface binding and IPv6 zone awareness.
 
-NAME
-    getapr - Get Address Pairs (getapr)
+## Features
 
-DESCRIPTION
-    This module provides getapr.get_addr_pairs(), which is intended
-    to be used instead of socket.getaddrinfo(). Instead of returning
-    a list of destination addresses, it returns a list of source and
-    destination address pairs. This mitigates the problem of the
-    operating system choosing an inappropriate source address.
-    Nevertheless, upper layer code needs to cycle through the list
-    of address pairs until it makes a successful connection.
-    
-    The module also provides getapr.init_getapr() which initialises
-    the state information and asynchronous processes used by
-    get_addr_pairs(). This initialisation will take at least
-    10 seconds and includes network probes. If the user does not
-    call this function, it will be called automatically by the
-    first call to get_addr_pairs().
-    
-    The module also provides getapr.status() which returns a
-    Python dictionary indicating the detected connectivity
-    status. For example, getapr.status()['NPTv6'] is a Boolean
-    indicating whether an NPTv6 or NAT66 translator is present.
-    
-    This code is a prototype. It does not cover all possible
-    complications. It uses two randomly chosen Atlas probes
-    as initial probe targets. IPv6 is always preferred if
-    available. A rolling average latency is recorded and used
-    for sorting results. Some features are missing so far:
+- Interface-specific testing (bound to specified network interface)
+- IPv6 zone/scope ID awareness
+- Link-local address restriction enforcement
+- Accurate latency measurements
+- Support for both IPv4 and IPv6
+- Verbose output mode
+- Configurable timeout and port settings
 
-    1) Source addresses should be ignored if they stop working,
-    to mitigate multihoming outages.
+## Installation
 
-    2) The probe targets should be refreshed periodically, to
-    spread load.
-    
-    The prototype was  tested on Windows 10 and Linux 5.4.0,
-    and it needs at least Python 3.9.
-    
-    Note for programmers: The handling of interface (a.k.a. scope
-    or zone) identifiers is very different between the Windows
-    and POSIX socket APIs. The code attempts to handle link local
-    addresses consistently despite these differences, but there
-    may be glitches.
+```
+git clone https://github.com/buraglio/getapr-golang.git
+cd getapr
+go build -o getapr
+```
 
-FUNCTIONS
-    get_addr_pairs(target, port, printing=False)
-        Get source and destination address pairs for the target host.
-        The target is a domain name, or an IPv4 or IPv6 address string.
-        A list of (AF, SA, DA) 3-tuples is returned. The list is empty
-        if no address pair is found. The AF will be socket.AF_INET
-        or socket.AF_INET6 and can be passed directly to socket.socket().
-        The addresses are returned as tuples that can be passed directly to
-        socket.bind() and socket.connect(). For example,
-        
-            pairs = get_addr_pairs("www.example.com", 80)
-            if pairs:
-                AF, SA, DA = pairs[0]
-                user_sock = socket.socket(AF, socket.SOCK_STREAM)
-                user_sock.bind(SA)
-                user_sock.connect(DA)
-        
-        The port parameter is used only to build the appropriate DA tuple.
-        
-        The user is strongly recommended to try the address pairs in sequence.
-        IPv6 addresses always come first if available.
-        
-        The optional 'printing' parameter controls informational printing
-        and is intended for debugging.
-    
-    init_getapr(printing=False)
-        Initialise data and threads for source address detection and
-        destination probing.
-        
-        The optional 'printing' parameter controls informational printing
-        and is intended for debugging.
-        
-        Initialisation takes at least 10 seconds and includes network probes.
-    
-    status()
-        Returns dictionary showing detected connectivity status.
+## Usage
 
-DATA
-    GUA_ok = False
-    IPv4_ok = False
-    LLA_ok = False
-    NAT44 = False
-    NAT44_tried = False
-    NPTv6 = False
-    NPTv6_tried = False
-    RFC1918 = False
-    ULA_ok = False
-    ULA_present = False
-    def_gateway4 = None
-    def_gateway6 = None
-~~~
+`./getapr -i interface [options] host`
+
+
+### Required Flags
+
+```
+Flag	Description
+-i, --interface	Network interface to use (e.g., eth0, en0, wlan0)
+```
+
+### Options
+
+```
+Flag	Description	Default
+-p, --port	Port number to test	80
+-t, --timeout	Timeout in seconds	2
+-v, --verbose	Enable verbose output	false
+-h, --help	Show help message	
+```
+
+
+## Examples
+
+### Basic usage
+`./getapr -i eth0 www.ietf.org`
+
+### Test HTTPS connectivity with verbose output
+`./getapr -i en0 -p 443 -v example.com`
+
+### Custom timeout of 5 seconds
+
+`./getapr -i wlan0 -t 5 google.com`
+
+### Output Format
+The program outputs connection pairs in the following format:
+
+Text Only
+Source: source_ip → Dest: dest_ip | Latency: duration [Zone info]
+
+### Example:
+
+Text Only
+```
+Source: 192.168.1.100 → Dest: 93.184.216.34 | Latency: 23.456ms
+Source: fe80::1%eth0 → Dest: fe80::2%eth0 | Latency: 1.234ms (Source Zone: eth0, Dest Zone: eth0)
+```
+
+### IPv6 Zone Handling
+
+The tool strictly enforces IPv6 zone/scope rules:
+- Link-local addresses can only communicate with other link-local addresses in the same zone
+- IPv6 zone identifiers are preserved and displayed in results
+- Link-local addresses never attempt to reach global addresses
+
+## Requirements
+Go 1.16 or later
+Linux/macOS/Unix (Windows support untested)
+Root privileges may be required for certain interface operations
+
+## Limitations
+
+Currently only tests TCP connectivity
+
+Doesn't support multiple simultaneous interface testing
+
+Windows support hasn't been thoroughly tested, but it should compile
+
+It's probably buggy and sub-optimal in many, many ways
+
+## Contributing
+Pull requests and issues are welcome, but probably open up an issue first - let's discuss it. Please ensure:
+- Code follows existing style or improves it.
+- New features include tests
+- Documentation is updated
+
+Note: This tool was originally ported from a Python implementation to Go, see `attic`.
