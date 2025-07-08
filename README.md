@@ -1,7 +1,8 @@
 Markdown
 # GetAPR - Advanced Path Reporter
 
-A Go implementation of network path analysis tool that tests connectivity between source and destination addresses with strict interface binding and IPv6 zone awareness.
+A Go implementation of network path analysis tool that tests connectivity between source and destination addresses with strict interface binding and IPv6 zone awareness. Like its progenitor, its intention is to provide address pairs with latency details that can be used to determine the best possible pair of addresses instead of returning a list of destination addresses, it returns a list of source and destination address pairs. This mitigates the problem of the operating system choosing an inappropriate source address.
+Nevertheless, upper layer code needs to cycle through the list of address pairs until it makes a successful connection. There is probably a lot of room for improvement. 
 
 ## Features
 
@@ -43,7 +44,6 @@ Flag	Description	Default
 -h, --help	Show help message	
 ```
 
-
 ## Examples
 
 ### Basic usage
@@ -59,12 +59,10 @@ Flag	Description	Default
 ### Output Format
 The program outputs connection pairs in the following format:
 
-Text Only
 Source: source_ip → Dest: dest_ip | Latency: duration [Zone info]
 
 ### Example:
 
-Text Only
 ```
 Source: 192.168.1.100 → Dest: 93.184.216.34 | Latency: 23.456ms
 Source: fe80::1%eth0 → Dest: fe80::2%eth0 | Latency: 1.234ms (Source Zone: eth0, Dest Zone: eth0)
@@ -98,4 +96,4 @@ Pull requests and issues are welcome, but probably open up an issue first - let'
 - New features include tests
 - Documentation is updated
 
-Note: This tool was originally ported from a Python implementation to Go, see `attic`.
+Note: This tool was originally ported from a [Python implementation](https://github.com/becarpenter/getapr) to Go, see `attic`.
