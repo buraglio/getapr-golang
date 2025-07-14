@@ -52,12 +52,13 @@ func NewGetAPR(iface string) *GetAPR {
 	}
 }
 
+// This is gross and ugly but it needs a fallback to use as a resolver if something goes wrong. This won't work on windows.
 func getSystemResolver() string {
 	config, _ := dns.ClientConfigFromFile("/etc/resolv.conf")
 	if config != nil && len(config.Servers) > 0 {
 		return config.Servers[0]
 	}
-	return "8.8.8.8"
+	return "1.1.1.1"
 }
 
 func isDNSSECValidated(host string, resolver string) bool {
