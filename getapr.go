@@ -60,6 +60,25 @@ func getSystemResolver() string {
 	return "8.8.8.8"
 }
 
+func isDNSSECValidated(host string, resolver string) bool {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	m.SetEdns0(4096, true)
+
+	c := new(dns.Client)
+	r, _, err := c.Exchange(m, resolver+":53")
+	return err == nil && r.AuthenticatedData
+}
+
+func hasSVCBRecords(host string, resolver string) bool {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
+
+	c := new(dns.Client)
+	r, _, err := c.Exchange(m, resolver+":53")
+	return err == nil && len(r.Answer) > 0
+}
+
 func (g *GetAPR) sortAddrPairs(pairs []AddrPair) []AddrPair {
 	sort.Slice(pairs, func(i, j int) bool {
 		a, b := pairs[i], pairs[j]
@@ -84,36 +103,6 @@ func (g *GetAPR) sortAddrPairs(pairs []AddrPair) []AddrPair {
 		return weightedLatencyA < weightedLatencyB
 	})
 	return pairs
-}
-
-func (g *GetAPR) querySVCB(host string) ([]AddrPair, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
-	m.SetEdns0(4096, true) // Enable DNSSEC
-
-	r, _, err := g.dnsClient.Exchange(m, g.resolver+":53")
-	if err != nil {
-		return nil, err
-	}
-
-	var results []AddrPair
-	for _, ans := range r.Answer {
-		if svcb, ok := ans.(*dns.HTTPS); ok {
-			for _, ip := range resolveTarget(svcb.Target) {
-				results = append(results, AddrPair{
-					Dest:         ip,
-					SVCBPriority: svcb.Priority,
-					DNSSECValid:  r.AuthenticatedData,
-				})
-			}
-		}
-	}
-	return results, nil
-}
-
-func resolveTarget(target string) []net.IP {
-	ips, _ := net.LookupIP(target)
-	return ips
 }
 
 func (g *GetAPR) detectNAT64() bool {
@@ -158,26 +147,9 @@ func (g *GetAPR) resolveWithNAT64(host string) ([]net.IP, error) {
 
 func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
 	var pairs []AddrPair
+	dnssecValid := isDNSSECValidated(host, g.resolver)
+	hasSVCB := hasSVCBRecords(host, g.resolver)
 
-	// Try SVCB/HTTPS records first
-	if svcbPairs, err := g.querySVCB(host); err == nil && len(svcbPairs) > 0 {
-		for _, pair := range svcbPairs {
-			for _, src := range g.sourceAddrs {
-				if ok, latency := g.testConnection(src, pair.Dest, port); ok {
-					pair.Source = src.Source
-					pair.SourceZone = src.SourceZone
-					pair.Latency = latency
-					pair.AddressFamily = 6
-					pairs = append(pairs, pair)
-				}
-			}
-		}
-		if len(pairs) > 0 {
-			return g.sortAddrPairs(pairs)
-		}
-	}
-
-	// Regular DNS resolution
 	ips, err := net.LookupIP(host)
 	if err != nil && g.detectNAT64() {
 		if nat64IPs, err := g.resolveWithNAT64(host); err == nil {
@@ -200,14 +172,21 @@ func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
 			}
 
 			if ok, latency := g.testConnection(src, destIP, port); ok {
-				pairs = append(pairs, AddrPair{
+				pair := AddrPair{
 					Source:        src.Source,
 					SourceZone:    src.SourceZone,
 					Dest:          destIP,
 					Latency:       latency,
 					AddressFamily: af,
+					DNSSECValid:   dnssecValid,
 					IsNAT64:       strings.HasPrefix(destIP.String(), "64:ff9b::"),
-				})
+				}
+
+				if hasSVCB {
+					pair.SVCBPriority = 1
+				}
+
+				pairs = append(pairs, pair)
 			}
 		}
 	}
@@ -276,6 +255,7 @@ func main() {
 		timeout   int
 		verbose   bool
 		port      int
+		host      string
 	)
 
 	flag.StringVar(&ifaceName, "i", "", "Network interface to use")
@@ -289,30 +269,49 @@ func main() {
 		fmt.Println("Usage: getapr [-i interface] [-p port] [-t timeout] [-v] <host>")
 		os.Exit(1)
 	}
+	host = args[0]
 
-	host := args[0]
 	apr := NewGetAPR(ifaceName)
 	apr.dnsClient.Timeout = time.Duration(timeout) * time.Second
 	apr.Init(port, verbose)
 
 	pairs := apr.GetAddrPairs(host, port)
+	if len(pairs) == 0 {
+		fmt.Println("No valid address pairs found")
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n%-15s → %-23s %-8s %-6s %-8s %-7s %s\n",
+		"Source", "Destination", "Latency", "Family", "SVCB Pri", "NAT64", "DNSSEC")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Println("Note:")
+	fmt.Println("- SVCB Pri shown when HTTPS records exist")
+	fmt.Println("- NAT64 marked for 64:ff9b:: addresses")
+	fmt.Println("- DNSSEC ✓ when validated")
+	fmt.Println(strings.Repeat("-", 80))
+
 	for _, pair := range pairs {
-		flags := ""
-		if pair.DNSSECValid {
-			flags += "D"
-		}
-		if pair.IsNAT64 {
-			flags += "N"
-		}
+		family := fmt.Sprintf("IPv%d", pair.AddressFamily)
+		svcbPrio := ""
 		if pair.SVCBPriority > 0 {
-			flags += fmt.Sprintf("P%d", pair.SVCBPriority)
+			svcbPrio = fmt.Sprintf("%d", pair.SVCBPriority)
 		}
-		if flags != "" {
-			flags = " [" + flags + "]"
+		nat64 := ""
+		if pair.IsNAT64 {
+			nat64 = "✓"
+		}
+		dnssec := ""
+		if pair.DNSSECValid {
+			dnssec = "✓"
 		}
 
-		fmt.Printf("%-15s → %-15s | %-8v | IPv%d%s\n",
-			pair.Source, pair.Dest, pair.Latency.Round(time.Millisecond),
-			pair.AddressFamily, flags)
+		fmt.Printf("%-15s → %-23s %-8v %-6s %-8s %-7s %s\n",
+			pair.Source,
+			pair.Dest,
+			pair.Latency.Round(time.Millisecond),
+			family,
+			svcbPrio,
+			nat64,
+			dnssec)
 	}
 }
