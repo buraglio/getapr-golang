@@ -10,406 +10,308 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/miekg/dns"
+)
+
+const (
+	DefaultPort            = 80
+	DefaultTimeout         = 2 * time.Second
+	DefaultResolutionDelay = 50 * time.Millisecond
 )
 
 type AddrPair struct {
-	Source      net.IP
-	SourceZone  string
-	Dest        net.IP
-	DestZone    string
-	Latency     time.Duration
-	ScopeID     int
-	SameNetwork bool
+	Source        net.IP
+	SourceZone    string
+	Dest          net.IP
+	DestZone      string
+	Latency       time.Duration
+	Attempts      int
+	LastAttempt   time.Time
+	SameNetwork   bool
+	AddressFamily int
+	SVCBPriority  uint16
+	DNSSECValid   bool
+	IsNAT64       bool
 }
 
 type GetAPR struct {
-	mu           sync.Mutex
-	sourceAddrs  []AddrPair
-	destAddrs    []AddrPair
-	addrPairs    []AddrPair
-	pollCount    int
-	maxDestAddrs int
-	initialized  bool
-	timeout      time.Duration
-	ulaPresent   bool
-	rfc1918      bool
-	targetIface  string
+	mu          sync.Mutex
+	sourceAddrs []AddrPair
+	addrPairs   []AddrPair
+	dnsClient   *dns.Client
+	resolver    string
 }
 
 func NewGetAPR(iface string) *GetAPR {
 	return &GetAPR{
-		maxDestAddrs: 10,
-		timeout:      2 * time.Second,
-		targetIface:  iface,
+		dnsClient: &dns.Client{
+			Timeout: DefaultTimeout,
+		},
+		resolver: getSystemResolver(),
 	}
 }
 
-func isULA(ip net.IP) bool {
-	if len(ip) != net.IPv6len {
-		return false
+func getSystemResolver() string {
+	config, _ := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if config != nil && len(config.Servers) > 0 {
+		return config.Servers[0]
 	}
-	return ip[0] == 0xfd || ip[0] == 0xfc
+	return "8.8.8.8"
 }
 
-func isPrivateIPv4(ip net.IP) bool {
-	if len(ip) != net.IPv4len {
-		return false
-	}
-	return ip[0] == 10 ||
-		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
-		(ip[0] == 192 && ip[1] == 168)
+func isDNSSECValidated(host string, resolver string) bool {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	m.SetEdns0(4096, true)
+
+	c := new(dns.Client)
+	r, _, err := c.Exchange(m, resolver+":53")
+	return err == nil && r.AuthenticatedData
 }
 
-func parseZone(ipStr string) (net.IP, string) {
-	if idx := strings.LastIndex(ipStr, "%"); idx != -1 {
-		ip := net.ParseIP(ipStr[:idx])
-		return ip, ipStr[idx+1:]
-	}
-	return net.ParseIP(ipStr), ""
+func hasSVCBRecords(host string, resolver string) bool {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
+
+	c := new(dns.Client)
+	r, _, err := c.Exchange(m, resolver+":53")
+	return err == nil && len(r.Answer) > 0
 }
 
-func (g *GetAPR) UpdateSources() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	g.sourceAddrs = []AddrPair{}
-	iface, err := net.InterfaceByName(g.targetIface)
-	if err != nil {
-		return fmt.Errorf("interface %s not found: %v", g.targetIface, err)
-	}
-
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return fmt.Errorf("failed to get addresses for interface %s: %v", g.targetIface, err)
-	}
-
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok {
-			continue
-		}
-
-		ip := ipNet.IP
-		if ip.IsLoopback() || ip.IsUnspecified() {
-			continue
-		}
-
-		zone := ""
-		if ip.To4() == nil && ip.IsLinkLocalUnicast() {
-			zone = iface.Name
-		}
-
-		if ip.To4() == nil && isULA(ip) {
-			g.ulaPresent = true
-		} else if ip.To4() != nil && isPrivateIPv4(ip) {
-			g.rfc1918 = true
-		}
-
-		g.sourceAddrs = append(g.sourceAddrs, AddrPair{
-			Source:     ip,
-			SourceZone: zone,
-		})
-	}
-
-	if len(g.sourceAddrs) == 0 {
-		return fmt.Errorf("no valid addresses found on interface %s", g.targetIface)
-	}
-
-	return nil
-}
-
-func (g *GetAPR) testConnection(src AddrPair, dst AddrPair, port int) (bool, time.Duration) {
-	if src.Source.IsLinkLocalUnicast() {
-		if !dst.Source.IsLinkLocalUnicast() || src.SourceZone != dst.SourceZone {
-			return false, 0
-		}
-	}
-
-	dstAddr := dst.Source.String()
-	if dst.Source.IsLinkLocalUnicast() && dst.SourceZone != "" {
-		dstAddr += "%" + dst.SourceZone
-	}
-
-	dialer := &net.Dialer{
-		Timeout:   g.timeout,
-		LocalAddr: &net.TCPAddr{IP: src.Source, Zone: src.SourceZone},
-	}
-
-	start := time.Now()
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(dstAddr, strconv.Itoa(port)))
-	if err != nil {
-		return false, 0
-	}
-	defer conn.Close()
-
-	_, err = conn.Write([]byte("HEAD / HTTP/1.0\r\n\r\n"))
-	if err != nil {
-		return false, 0
-	}
-
-	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
-	if err != nil {
-		return false, 0
-	}
-
-	return true, time.Since(start)
-}
-
-func (g *GetAPR) validAddressPair(src, dst AddrPair) bool {
-	if src.Source.IsLinkLocalUnicast() {
-		return dst.Source.IsLinkLocalUnicast() && src.SourceZone == dst.SourceZone
-	}
-	if dst.Source.IsLinkLocalUnicast() {
-		return false
-	}
-	return true
-}
-
-func (g *GetAPR) poll(port int) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		g.mu.Lock()
-		srcs := make([]AddrPair, len(g.sourceAddrs))
-		copy(srcs, g.sourceAddrs)
-		dests := make([]AddrPair, len(g.destAddrs))
-		copy(dests, g.destAddrs)
-		g.mu.Unlock()
-
-		for _, src := range srcs {
-			var removeDests []AddrPair
-			for _, dst := range dests {
-				if !g.validAddressPair(src, dst) {
-					continue
-				}
-
-				ok, latency := g.testConnection(src, dst, port)
-				g.mu.Lock()
-				if ok {
-					found := false
-					for i, pair := range g.addrPairs {
-						if pair.Source.Equal(src.Source) && pair.Dest.Equal(dst.Source) {
-							g.addrPairs[i].Latency = latency
-							found = true
-							break
-						}
-					}
-					if !found {
-						g.addrPairs = append(g.addrPairs, AddrPair{
-							Source:      src.Source,
-							SourceZone:  src.SourceZone,
-							Dest:        dst.Source,
-							DestZone:    dst.SourceZone,
-							Latency:     latency,
-							SameNetwork: src.SourceZone == dst.SourceZone,
-						})
-					}
-				} else {
-					removeDests = append(removeDests, dst)
-				}
-				g.mu.Unlock()
-			}
-
-			if len(removeDests) > 0 {
-				g.mu.Lock()
-				var newDests []AddrPair
-				for _, d := range g.destAddrs {
-					keep := true
-					for _, rd := range removeDests {
-						if d.Source.Equal(rd.Source) {
-							keep = false
-							break
-						}
-					}
-					if keep {
-						newDests = append(newDests, d)
-					}
-				}
-				g.destAddrs = newDests
-				g.mu.Unlock()
-			}
-		}
-
-		g.pollCount++
-		if g.pollCount > 1000 {
-			g.pollCount = 0
-		}
-	}
-}
-
-func (g *GetAPR) Init(port int, verbose bool) {
-	if g.initialized {
-		return
-	}
-
-	if err := g.UpdateSources(); err != nil {
-		if verbose {
-			fmt.Printf("Warning: %v\n", err)
-		}
-		return
-	}
-
-	go g.poll(port)
-	g.initialized = true
-
-	if verbose {
-		fmt.Printf("Initialized with interface %s addresses:\n", g.targetIface)
-		for _, addr := range g.sourceAddrs {
-			addrType := "Global"
-			if addr.Source.IsLinkLocalUnicast() {
-				addrType = "Link-Local"
-			} else if isULA(addr.Source) {
-				addrType = "ULA"
-			} else if addr.Source.To4() != nil && isPrivateIPv4(addr.Source) {
-				addrType = "RFC1918"
-			}
-			fmt.Printf("- %s (Type: %s, Zone: %s)\n", addr.Source, addrType, addr.SourceZone)
-		}
-	}
-}
-
-func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
-	if !g.initialized {
-		g.Init(port, false)
-	}
-
-	var pairs []AddrPair
-	rawAddrs, err := net.LookupIP(host)
-	if err != nil {
-		return pairs
-	}
-
-	var destAddrs []AddrPair
-	for _, addr := range rawAddrs {
-		destAddrs = append(destAddrs, AddrPair{
-			Source:     addr,
-			SourceZone: "",
-		})
-	}
-
-	sort.Slice(destAddrs, func(i, j int) bool {
-		return len(destAddrs[i].Source) == net.IPv6len && len(destAddrs[j].Source) != net.IPv6len
-	})
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for _, dst := range destAddrs {
-		for _, src := range g.sourceAddrs {
-			if !g.validAddressPair(src, dst) {
-				continue
-			}
-
-			ok, latency := g.testConnection(src, dst, port)
-			if ok {
-				pairs = append(pairs, AddrPair{
-					Source:      src.Source,
-					SourceZone:  src.SourceZone,
-					Dest:        dst.Source,
-					DestZone:    dst.SourceZone,
-					Latency:     latency,
-					SameNetwork: src.SourceZone == dst.SourceZone,
-				})
-			}
-		}
-	}
-
+func (g *GetAPR) sortAddrPairs(pairs []AddrPair) []AddrPair {
 	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].SameNetwork && !pairs[j].SameNetwork {
-			return true
-		}
-		if !pairs[i].SameNetwork && pairs[j].SameNetwork {
-			return false
-		}
-		if len(pairs[i].Source) == net.IPv6len && len(pairs[j].Source) != net.IPv6len {
-			return true
-		}
-		if len(pairs[i].Source) != net.IPv6len && len(pairs[j].Source) == net.IPv6len {
-			return false
-		}
-		return pairs[i].Latency < pairs[j].Latency
-	})
+		a, b := pairs[i], pairs[j]
 
+		if a.AddressFamily != b.AddressFamily {
+			return a.AddressFamily == 6
+		}
+		if a.SVCBPriority != b.SVCBPriority {
+			return a.SVCBPriority < b.SVCBPriority
+		}
+		if a.DNSSECValid != b.DNSSECValid {
+			return a.DNSSECValid
+		}
+		if a.DestZone != b.DestZone {
+			return a.DestZone < b.DestZone
+		}
+		if a.IsNAT64 != b.IsNAT64 {
+			return !a.IsNAT64
+		}
+		weightedLatencyA := a.Latency * time.Duration(a.Attempts+1)
+		weightedLatencyB := b.Latency * time.Duration(b.Attempts+1)
+		return weightedLatencyA < weightedLatencyB
+	})
 	return pairs
 }
 
-func (g *GetAPR) Status() map[string]bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return map[string]bool{
-		"ULA_present": g.ulaPresent,
-		"RFC1918":     g.rfc1918,
+func (g *GetAPR) detectNAT64() bool {
+	m := new(dns.Msg)
+	m.SetQuestion("ipv4only.arpa.", dns.TypeAAAA)
+
+	r, _, err := g.dnsClient.Exchange(m, g.resolver+":53")
+	if err != nil {
+		return false
 	}
+
+	for _, ans := range r.Answer {
+		if a, ok := ans.(*dns.AAAA); ok {
+			if strings.HasPrefix(a.AAAA.String(), "64:ff9b::") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-func printHelp() {
-	fmt.Println("Usage: getapr -i <interface> [options] <host>")
-	fmt.Println("Required flags:")
-	fmt.Println("  -i, --interface  Network interface to use")
-	fmt.Println("Options:")
-	fmt.Println("  -h, --help       Show this help message")
-	fmt.Println("  -p, --port       Port number (default: 80)")
-	fmt.Println("  -t, --timeout    Timeout in seconds (default: 2)")
-	fmt.Println("  -v, --verbose    Verbose output")
+func (g *GetAPR) resolveWithNAT64(host string) ([]net.IP, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
+
+	r, _, err := g.dnsClient.Exchange(m, g.resolver+":53")
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	for _, ans := range r.Answer {
+		if a, ok := ans.(*dns.A); ok {
+			nat64IP := net.ParseIP("64:ff9b::" + a.A.String())
+			if nat64IP != nil {
+				ips = append(ips, nat64IP)
+			}
+		}
+	}
+	return ips, nil
+}
+
+func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
+	var pairs []AddrPair
+	dnssecValid := isDNSSECValidated(host, g.resolver)
+	hasSVCB := hasSVCBRecords(host, g.resolver)
+
+	ips, err := net.LookupIP(host)
+	if err != nil && g.detectNAT64() {
+		if nat64IPs, err := g.resolveWithNAT64(host); err == nil {
+			ips = nat64IPs
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	for _, destIP := range ips {
+		af := 4
+		if destIP.To4() == nil {
+			af = 6
+		}
+
+		for _, src := range g.sourceAddrs {
+			if src.AddressFamily != af {
+				continue
+			}
+
+			if ok, latency := g.testConnection(src, destIP, port); ok {
+				pair := AddrPair{
+					Source:        src.Source,
+					SourceZone:    src.SourceZone,
+					Dest:          destIP,
+					Latency:       latency,
+					AddressFamily: af,
+					DNSSECValid:   dnssecValid,
+					IsNAT64:       strings.HasPrefix(destIP.String(), "64:ff9b::"),
+				}
+
+				if hasSVCB {
+					pair.SVCBPriority = 1
+				}
+
+				pairs = append(pairs, pair)
+			}
+		}
+	}
+
+	return g.sortAddrPairs(pairs)
+}
+
+func (g *GetAPR) testConnection(src AddrPair, dest net.IP, port int) (bool, time.Duration) {
+	target := net.JoinHostPort(dest.String(), strconv.Itoa(port))
+	dialer := &net.Dialer{
+		Timeout:   DefaultTimeout,
+		LocalAddr: &net.TCPAddr{IP: src.Source, Port: 0},
+	}
+
+	start := time.Now()
+	conn, err := dialer.Dial("tcp", target)
+	if err != nil {
+		return false, 0
+	}
+	conn.Close()
+	return true, time.Since(start)
+}
+
+func (g *GetAPR) Init(port int, verbose bool) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+
+			af := 4
+			if ip.To4() == nil {
+				af = 6
+			}
+
+			g.sourceAddrs = append(g.sourceAddrs, AddrPair{
+				Source:        ip,
+				SourceZone:    iface.Name,
+				AddressFamily: af,
+			})
+		}
+	}
 }
 
 func main() {
 	var (
-		help      bool
-		port      int
+		ifaceName string
 		timeout   int
 		verbose   bool
-		ifaceName string
+		port      int
+		host      string
 	)
 
-	flag.BoolVar(&help, "h", false, "Show help")
-	flag.BoolVar(&help, "help", false, "Show help")
-	flag.IntVar(&port, "p", 80, "Port number")
-	flag.IntVar(&port, "port", 80, "Port number")
+	flag.StringVar(&ifaceName, "i", "", "Network interface to use")
 	flag.IntVar(&timeout, "t", 2, "Timeout in seconds")
-	flag.IntVar(&timeout, "timeout", 2, "Timeout in seconds")
+	flag.IntVar(&port, "p", DefaultPort, "Port number")
 	flag.BoolVar(&verbose, "v", false, "Verbose output")
-	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
-	flag.StringVar(&ifaceName, "i", "", "Network interface to use (required)")
-	flag.StringVar(&ifaceName, "interface", "", "Network interface to use (required)")
 	flag.Parse()
-
-	if help {
-		printHelp()
-		os.Exit(0)
-	}
-
-	if ifaceName == "" {
-		fmt.Println("Error: interface flag is required")
-		printHelp()
-		os.Exit(1)
-	}
 
 	args := flag.Args()
 	if len(args) < 1 {
-		printHelp()
+		fmt.Println("Usage: getapr [-i interface] [-p port] [-t timeout] [-v] <host>")
 		os.Exit(1)
 	}
+	host = args[0]
 
-	host := args[0]
 	apr := NewGetAPR(ifaceName)
-	apr.timeout = time.Duration(timeout) * time.Second
+	apr.dnsClient.Timeout = time.Duration(timeout) * time.Second
 	apr.Init(port, verbose)
 
 	pairs := apr.GetAddrPairs(host, port)
-	for _, pair := range pairs {
-		zoneInfo := ""
-		if pair.SourceZone != "" || pair.DestZone != "" {
-			zoneInfo = fmt.Sprintf(" (Source Zone: %s, Dest Zone: %s)", pair.SourceZone, pair.DestZone)
-		}
-		fmt.Printf("Source: %s → Dest: %s | Latency: %v%s\n",
-			pair.Source, pair.Dest, pair.Latency.Round(time.Millisecond), zoneInfo)
+	if len(pairs) == 0 {
+		fmt.Println("No valid address pairs found")
+		os.Exit(1)
 	}
 
-	if verbose {
-		status := apr.Status()
-		fmt.Printf("Status: %+v\n", status)
+	fmt.Printf("\n%-15s → %-23s %-8s %-6s %-8s %-7s %s\n",
+		"Source", "Destination", "Latency", "Family", "SVCB Pri", "NAT64", "DNSSEC")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Println("Note:")
+	fmt.Println("- SVCB Pri shown when HTTPS records exist")
+	fmt.Println("- NAT64 marked for 64:ff9b:: addresses")
+	fmt.Println("- DNSSEC ✓ when validated")
+	fmt.Println(strings.Repeat("-", 80))
+
+	for _, pair := range pairs {
+		family := fmt.Sprintf("IPv%d", pair.AddressFamily)
+		svcbPrio := ""
+		if pair.SVCBPriority > 0 {
+			svcbPrio = fmt.Sprintf("%d", pair.SVCBPriority)
+		}
+		nat64 := ""
+		if pair.IsNAT64 {
+			nat64 = "✓"
+		}
+		dnssec := ""
+		if pair.DNSSECValid {
+			dnssec = "✓"
+		}
+
+		fmt.Printf("%-15s → %-23s %-8v %-6s %-8s %-7s %s\n",
+			pair.Source,
+			pair.Dest,
+			pair.Latency.Round(time.Millisecond),
+			family,
+			svcbPrio,
+			nat64,
+			dnssec)
 	}
 }

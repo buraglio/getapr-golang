@@ -10,15 +10,22 @@ Nevertheless, upper layer code needs to cycle through the list of address pairs 
 - IPv6 zone/scope ID awareness
 - Link-local address restriction enforcement
 - Accurate latency measurements
-- Support for both IPv4 and IPv6
+- Support for both IPv4 and IPv6, with support for ranking based on [rfc6724-update](https://datatracker.ietf.org/doc/draft-ietf-6man-rfc6724-update/)
 - Verbose output mode
 - Configurable timeout and port settings
+- Functionality more closely resembling [Happy Eyeballs v3](https://datatracker.ietf.org/doc/draft-ietf-happy-happyeyeballs-v3/)
+- Proper DNSSEC validation
+- Proper query and ranking based on HTTPS/SVCB records
+- Simple detection of NAT64 in the path (uses simple detection method based on ipv4only.arpa and 64::)
+- "Pretty" formatting output with human readable table
 
 ## Installation
 
 ```
 git clone https://github.com/buraglio/getapr-golang.git
 cd getapr
+go mod init
+go get github.com/miekg/dns
 go build -o getapr
 ```
 
@@ -38,34 +45,47 @@ Flag	Description
 
 ```
 Flag	Description	Default
--p, --port	Port number to test	80
--t, --timeout	Timeout in seconds	2
--v, --verbose	Enable verbose output	false
+-p, --port	Port number to test	(default: 80)
+-t, --timeout	Timeout in seconds	(default: 2)
+-v, --verbose	Enable verbose output	(default: false)
 -h, --help	Show help message	
 ```
 
 ## Examples
 
 ### Basic usage
-`./getapr -i eth0 www.ietf.org`
+`./getapr -i en0 -p 443 -t 1 -v ipv6.army`
 
 ### Test HTTPS connectivity with verbose output
-`./getapr -i en0 -p 443 -v example.com`
+`./getapr -i en0 -p 443 -t 1 -v ipv6.army`
 
 ### Custom timeout of 5 seconds
 
-`./getapr -i wlan0 -t 5 google.com`
+`./getapr -i en0 -p 443 -t 1 -v ipv6.army`
 
 ### Output Format
 The program outputs connection pairs in the following format:
 
-Source: source_ip → Dest: dest_ip | Latency: duration [Zone info]
+```
+Source          → Destination             Latency  Family SVCB Pri NAT64   DNSSEC
+```
 
 ### Example:
 
 ```
-Source: 192.168.1.100 → Dest: 93.184.216.34 | Latency: 23.456ms
-Source: fe80::1%eth0 → Dest: fe80::2%eth0 | Latency: 1.234ms (Source Zone: eth0, Dest Zone: eth0)
+Source          → Destination             Latency  Family SVCB Pri NAT64   DNSSEC
+--------------------------------------------------------------------------------
+Note:
+- SVCB Pri shown when HTTPS records exist
+- NAT64 marked for 64:ff9b:: addresses
+- DNSSEC ✓ when validated
+--------------------------------------------------------------------------------
+3fff:c0ff:ee:8f01:1cff:70b9:6db0:2812 → 2600:1f18:16e:df01::258 29ms     IPv6   1                ✓
+3fff:c0ff:ee:8f01:60ee:d8b8:8f01:f05e → 2600:1f18:16e:df01::258 30ms     IPv6   1                ✓
+3fff:c0ff:ee:8f01:60ee:d8b8:8f01:f05e → 2600:1f18:16e:df01::259 32ms     IPv6   1                ✓
+3fff:c0ff:ee:8f01:1cff:70b9:6db0:2812 → 2600:1f18:16e:df01::259 47ms     IPv6   1                ✓
+10.9.40.9      → 18.208.88.157           31ms     IPv4   1                ✓
+10.9.40.9      → 98.84.224.111           32ms     IPv4   1                ✓
 ```
 
 ### IPv6 Zone Handling
@@ -80,15 +100,18 @@ Go 1.16 or later
 Linux/macOS/Unix (Windows support untested)
 Root privileges may be required for certain interface operations
 
-## Limitations
+## Limitations and Known issues
 
 Currently only tests TCP connectivity
 
-Doesn't support multiple simultaneous interface testing
+Doesn't support multiple simultaneous interface testing (by design, the first version did and it was an absolute mess)
 
-Windows support hasn't been thoroughly tested, but it should compile
+Windows support hasn't been tested, but it should compile
 
 It's probably buggy and sub-optimal in many, many ways
+
+Adding HE3 support made this fairly sluggish. It's almost certainly because of how it is implemented, and it could absolutely use someone with actual skill to
+take a look and fix it.
 
 ## Contributing
 Pull requests and issues are welcome, but probably open up an issue first - let's discuss it. Please ensure:
