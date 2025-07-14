@@ -61,7 +61,7 @@ Flag	Description	Default
 
 ### Custom timeout of 5 seconds
 
-`./getapr -i en0 -p 443 -t 1 -v ipv6.army`
+`./getapr -i en0 -p 443 -t 5 -v ipv6.army`
 
 ### Output Format
 The program outputs connection pairs in the following format:
