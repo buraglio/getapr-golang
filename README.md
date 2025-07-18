@@ -1,8 +1,8 @@
 Markdown
 # GetAPR - Advanced Path Reporter
 
-A Go implementation of network path analysis tool that tests connectivity between source and destination addresses with strict interface binding and IPv6 zone awareness. Like its progenitor, its intention is to provide address pairs with latency details that can be used to determine the best possible pair of addresses instead of returning a list of destination addresses, it returns a list of source and destination address pairs. This mitigates the problem of the operating system choosing an inappropriate source address.
-Nevertheless, upper layer code needs to cycle through the list of address pairs until it makes a successful connection. There is probably a lot of room for improvement. 
+A Go implementation of network path analysis tool that tests connectivity between source and destination addresses with strict interface binding and IPv6 zone awareness. Like its progenitor, its intention is to provide address pairs with latency details that can be used to determine the best possible pair of addresses. Instead of returning a list of destination addresses, it returns a list of source and destination address pairs, ranked based on latency and [rfc6724-update](https://datatracker.ietf.org/doc/draft-ietf-6man-rfc6724-update/). In theory, this mitigates the problem of the operating system choosing an inappropriate source address and lays a foundation of being able to choose other criteria for SA/DA pairing.
+Nevertheless, upper layer code needs to cycle through the list of address pairs until it makes a successful connection. There is definitely a lot of room for improvement, but the foundation is at least a working example of another option for SA/DA pairing. 
 
 ## Features
 
