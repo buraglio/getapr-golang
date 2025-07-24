@@ -48,7 +48,12 @@ Flag	Description	Default
 -p, --port	Port number to test	(default: 80)
 -t, --timeout	Timeout in seconds	(default: 2)
 -v, --verbose	Enable verbose output	(default: false)
+-k disable NAT64 detection (default: false)
+-d disable DNSSEC validation (default: false)
+-b disable SVCB/HTTPS record checking (default: false)
+-x disable all three tests (default: false)
 -h, --help	Show help message	
+
 ```
 
 ## Examples

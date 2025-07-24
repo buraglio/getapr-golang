@@ -52,32 +52,12 @@ func NewGetAPR(iface string) *GetAPR {
 	}
 }
 
-// This is gross and ugly but it needs a fallback to use as a resolver if something goes wrong. This won't work on windows.
 func getSystemResolver() string {
 	config, _ := dns.ClientConfigFromFile("/etc/resolv.conf")
 	if config != nil && len(config.Servers) > 0 {
 		return config.Servers[0]
 	}
-	return "1.1.1.1"
-}
-
-func isDNSSECValidated(host string, resolver string) bool {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
-	m.SetEdns0(4096, true)
-
-	c := new(dns.Client)
-	r, _, err := c.Exchange(m, resolver+":53")
-	return err == nil && r.AuthenticatedData
-}
-
-func hasSVCBRecords(host string, resolver string) bool {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
-
-	c := new(dns.Client)
-	r, _, err := c.Exchange(m, resolver+":53")
-	return err == nil && len(r.Answer) > 0
+	return "8.8.8.8"
 }
 
 func (g *GetAPR) sortAddrPairs(pairs []AddrPair) []AddrPair {
@@ -146,15 +126,94 @@ func (g *GetAPR) resolveWithNAT64(host string) ([]net.IP, error) {
 	return ips, nil
 }
 
-func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
-	var pairs []AddrPair
-	dnssecValid := isDNSSECValidated(host, g.resolver)
-	hasSVCB := hasSVCBRecords(host, g.resolver)
+func (g *GetAPR) checkDNSSEC(host string) bool {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	m.SetEdns0(4096, true)
 
+	r, _, err := g.dnsClient.Exchange(m, g.resolver+":53")
+	if err != nil {
+		return false
+	}
+	return r.AuthenticatedData
+}
+
+func (g *GetAPR) checkSVCB(host string) ([]AddrPair, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
+	m.SetEdns0(4096, true)
+
+	r, _, err := g.dnsClient.Exchange(m, g.resolver+":53")
+	if err != nil {
+		return nil, err
+	}
+
+	var results []AddrPair
+	for _, ans := range r.Answer {
+		if svcb, ok := ans.(*dns.HTTPS); ok {
+			ips, _ := net.LookupIP(svcb.Target)
+			for _, ip := range ips {
+				results = append(results, AddrPair{
+					Dest:         ip,
+					SVCBPriority: svcb.Priority,
+					DNSSECValid:  r.AuthenticatedData,
+					AddressFamily: func() int {
+						if ip.To4() == nil {
+							return 6
+						}
+						return 4
+					}(),
+				})
+			}
+		}
+	}
+	return results, nil
+}
+
+func (g *GetAPR) GetAddrPairs(host string, port int, noNAT64, noDNSSEC, noSVCB bool) []AddrPair {
+	var pairs []AddrPair
+	var dnssecValid bool
+	var svcbPairs []AddrPair
+	var err error
+
+	// Check DNSSEC unless disabled
+	if !noDNSSEC {
+		dnssecValid = g.checkDNSSEC(host)
+	}
+
+	// Check SVCB records unless disabled
+	if !noSVCB {
+		svcbPairs, err = g.checkSVCB(host)
+		if err == nil {
+			for _, svcbPair := range svcbPairs {
+				for _, src := range g.sourceAddrs {
+					if src.AddressFamily != svcbPair.AddressFamily {
+						continue
+					}
+					if ok, latency := g.testConnection(src, svcbPair.Dest, port); ok {
+						pairs = append(pairs, AddrPair{
+							Source:        src.Source,
+							SourceZone:    src.SourceZone,
+							Dest:          svcbPair.Dest,
+							Latency:       latency,
+							AddressFamily: svcbPair.AddressFamily,
+							SVCBPriority:  svcbPair.SVCBPriority,
+							DNSSECValid:   svcbPair.DNSSECValid,
+							IsNAT64:       strings.HasPrefix(svcbPair.Dest.String(), "64:ff9b::"),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// Regular DNS resolution
 	ips, err := net.LookupIP(host)
-	if err != nil && g.detectNAT64() {
-		if nat64IPs, err := g.resolveWithNAT64(host); err == nil {
-			ips = nat64IPs
+	if err != nil && !noNAT64 {
+		if g.detectNAT64() {
+			if nat64IPs, err := g.resolveWithNAT64(host); err == nil {
+				ips = nat64IPs
+			}
 		}
 	}
 
@@ -180,11 +239,17 @@ func (g *GetAPR) GetAddrPairs(host string, port int) []AddrPair {
 					Latency:       latency,
 					AddressFamily: af,
 					DNSSECValid:   dnssecValid,
-					IsNAT64:       strings.HasPrefix(destIP.String(), "64:ff9b::"),
+					IsNAT64:       !noNAT64 && strings.HasPrefix(destIP.String(), "64:ff9b::"),
 				}
 
-				if hasSVCB {
-					pair.SVCBPriority = 1
+				// Only set SVCB priority if we found records and SVCB checking is enabled
+				if !noSVCB && len(svcbPairs) > 0 {
+					for _, sp := range svcbPairs {
+						if sp.Dest.Equal(destIP) {
+							pair.SVCBPriority = sp.SVCBPriority
+							break
+						}
+					}
 				}
 
 				pairs = append(pairs, pair)
@@ -252,57 +317,96 @@ func (g *GetAPR) Init(port int, verbose bool) {
 
 func main() {
 	var (
-		ifaceName string
-		timeout   int
-		verbose   bool
-		port      int
-		host      string
+		ifaceName  string
+		timeout    int
+		verbose    bool
+		port       int
+		host       string
+		noNAT64    bool
+		noDNSSEC   bool
+		noSVCB     bool
+		disableAll bool
 	)
 
 	flag.StringVar(&ifaceName, "i", "", "Network interface to use")
+	flag.StringVar(&ifaceName, "interface", "", "Network interface to use")
 	flag.IntVar(&timeout, "t", 2, "Timeout in seconds")
+	flag.IntVar(&timeout, "timeout", 2, "Timeout in seconds")
 	flag.IntVar(&port, "p", DefaultPort, "Port number")
+	flag.IntVar(&port, "port", DefaultPort, "Port number")
 	flag.BoolVar(&verbose, "v", false, "Verbose output")
+	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
+	flag.BoolVar(&noNAT64, "k", false, "Disable NAT64 detection")
+	flag.BoolVar(&noDNSSEC, "d", false, "Disable DNSSEC validation")
+	flag.BoolVar(&noSVCB, "b", false, "Disable SVCB/HTTPS record checking")
+	flag.BoolVar(&disableAll, "x", false, "Disable all special tests (NAT64, DNSSEC, SVCB)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Println("Usage: getapr [-i interface] [-p port] [-t timeout] [-v] <host>")
+		fmt.Println("SA/DA selection and Happy Eyeballs v3 (light) Implementation")
+		fmt.Println("Usage: getapr [options] <host>")
+		fmt.Println("\nOptions:")
+		fmt.Println("  -i, --interface string  Network interface to use")
+		fmt.Println("  -t, --timeout int       Timeout in seconds (default 2)")
+		fmt.Println("  -p, --port int          Port number (default 80)")
+		fmt.Println("  -v, --verbose           Verbose output")
+		fmt.Println("  -k                      Disable NAT64 detection")
+		fmt.Println("  -d                      Disable DNSSEC validation")
+		fmt.Println("  -b                      Disable SVCB/HTTPS record checking")
+		fmt.Println("  -x                      Disable all special tests (equivalent to -k -d -b)")
+		fmt.Println("\nExamples:")
+		fmt.Println("  getapr example.com")
+		fmt.Println("  getapr -i eth0 -p 443 -t 5 example.com")
+		fmt.Println("  getapr -x example.com (disables all special tests)")
 		os.Exit(1)
 	}
 	host = args[0]
+
+	// If -x is set, override all individual test flags
+	if disableAll {
+		noNAT64 = true
+		noDNSSEC = true
+		noSVCB = true
+	}
 
 	apr := NewGetAPR(ifaceName)
 	apr.dnsClient.Timeout = time.Duration(timeout) * time.Second
 	apr.Init(port, verbose)
 
-	pairs := apr.GetAddrPairs(host, port)
+	pairs := apr.GetAddrPairs(host, port, noNAT64, noDNSSEC, noSVCB)
 	if len(pairs) == 0 {
 		fmt.Println("No valid address pairs found")
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n%-15s → %-23s %-8s %-6s %-8s %-7s %s\n",
+	// Prepare output. It's not really HEv3, but it kinda respects some aspects
+	fmt.Printf("\nSA/DA and Happy Eyeballs v3 (light) Results for %s:%d\n", host, port)
+	fmt.Println(strings.Repeat("=", 40))
+	fmt.Printf("%-15s → %-23s %-8s %-6s %-8s %-7s %s\n",
 		"Source", "Destination", "Latency", "Family", "SVCB Pri", "NAT64", "DNSSEC")
 	fmt.Println(strings.Repeat("-", 80))
-	fmt.Println("Note:")
-	fmt.Println("- SVCB Pri shown when HTTPS records exist")
-	fmt.Println("- NAT64 marked for 64:ff9b:: addresses")
-	fmt.Println("- DNSSEC ✓ when validated")
+
+	// Show configuration
+	fmt.Println("Active Configuration:")
+	fmt.Printf("- NAT64 Detection: %v\n", !noNAT64)
+	fmt.Printf("- DNSSEC Validation: %v\n", !noDNSSEC)
+	fmt.Printf("- SVCB Records: %v\n", !noSVCB)
 	fmt.Println(strings.Repeat("-", 80))
 
+	// Print results
 	for _, pair := range pairs {
 		family := fmt.Sprintf("IPv%d", pair.AddressFamily)
 		svcbPrio := ""
-		if pair.SVCBPriority > 0 {
+		if !noSVCB && pair.SVCBPriority > 0 {
 			svcbPrio = fmt.Sprintf("%d", pair.SVCBPriority)
 		}
 		nat64 := ""
-		if pair.IsNAT64 {
+		if !noNAT64 && pair.IsNAT64 {
 			nat64 = "✓"
 		}
 		dnssec := ""
-		if pair.DNSSECValid {
+		if !noDNSSEC && pair.DNSSECValid {
 			dnssec = "✓"
 		}
 
